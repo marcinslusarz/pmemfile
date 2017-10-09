@@ -205,6 +205,34 @@ pmemfile_read(PMEMfilepool *pfp, PMEMfile *file, void *buf, size_t count)
 	return pmemfile_readv(pfp, file, &element, 1);
 }
 
+static inline bool
+can_read_use_fastpath(PMEMfilepool *pfp, PMEMfile *file,
+		const pmemfile_iovec_t *iov, int iovcnt,
+		struct pmemfile_block_desc *last_block)
+{
+	if (!last_block)
+		return false;
+
+	if (iovcnt != 1)
+		return false;
+
+	if (file->offset < last_block->offset)
+		return false;
+
+	if (file->offset + iov[0].iov_len >=
+			last_block->offset + last_block->size)
+		return false;
+
+	if (file->offset + iov[0].iov_len >=
+			inode_get_size(file->vinode->inode))
+		return false;
+
+	if (iov[0].iov_len >= SSIZE_MAX)
+		return false;
+
+	return true;
+}
+
 static pmemfile_ssize_t
 pmemfile_readv_under_filelock(PMEMfilepool *pfp, PMEMfile *file,
 		const pmemfile_iovec_t *iov, int iovcnt)
@@ -234,9 +262,19 @@ pmemfile_readv_under_filelock(PMEMfilepool *pfp, PMEMfile *file,
 	uint64_t flags = file->flags;
 	last_block = file->block_pointer_cache;
 
-	ret = pmemfile_preadv_internal(pfp, file->vinode,
-		&last_block, file->offset, iov, iovcnt);
-
+	if (can_read_use_fastpath(pfp, file, iov, iovcnt, last_block)) {
+		if (last_block->flags & BLOCK_INITIALIZED) {
+			const char *src = PF_RO(pfp, last_block->data) +
+					file->offset - last_block->offset;
+			memcpy(iov[0].iov_base, src, iov[0].iov_len);
+		} else {
+			memset(iov[0].iov_base, 0, iov[0].iov_len);
+		}
+		ret = (ssize_t)iov[0].iov_len;
+	} else {
+		ret = pmemfile_preadv_internal(pfp, file->vinode,
+			&last_block, file->offset, iov, iovcnt);
+	}
 
 	os_rwlock_unlock(&file->vinode->rwlock);
 
